@@ -4,13 +4,17 @@ const fs = require("node:fs");
 function memorySqliteAdapter() {
   const store = {
     users: [],
+    contacts: [],
     conversations: [],
     conversation_members: [],
-    messages: []
+    messages: [],
+    community_messages: []
   };
   let userIdCounter = 1;
+  let contactIdCounter = 1;
   let convIdCounter = 1;
   let msgIdCounter = 1;
+  let commMsgIdCounter = 1;
 
   return {
     client: "sqlite-memory",
@@ -21,7 +25,7 @@ function memorySqliteAdapter() {
       }
       if (trimmed.startsWith("INSERT INTO USERS")) {
         const [username, email, password_hash] = params;
-        const user = { id: userIdCounter++, username, email, password_hash, created_at: new Date().toISOString() };
+        const user = { id: userIdCounter++, username, email, password_hash, status: "offline", last_seen: new Date().toISOString(), created_at: new Date().toISOString() };
         store.users.push(user);
         return { rows: [{ id: user.id, username: user.username, email: user.email, created_at: user.created_at }], rowCount: 1, insertId: user.id };
       }
@@ -165,7 +169,15 @@ function sqliteAdapter() {
           CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
             email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+            status TEXT DEFAULT 'offline', last_seen TEXT DEFAULT CURRENT_TIMESTAMP,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE TABLE IF NOT EXISTS contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            contact_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            status TEXT DEFAULT 'accepted', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, contact_id)
           );
           CREATE TABLE IF NOT EXISTS conversations (
             id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT,
@@ -182,11 +194,21 @@ function sqliteAdapter() {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
             sender_id INTEGER NOT NULL REFERENCES users(id),
-            body TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            body TEXT NOT NULL, reply_to INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             edited_at TEXT, deleted_at TEXT
+          );
+          CREATE TABLE IF NOT EXISTS community_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            community_id INTEGER NOT NULL, channel_id INTEGER NOT NULL,
+            sender_id INTEGER NOT NULL REFERENCES users(id),
+            body TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            deleted_at TEXT
           );
           CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);
           CREATE INDEX IF NOT EXISTS idx_members_user ON conversation_members(user_id);
+          CREATE INDEX IF NOT EXISTS idx_community_messages ON community_messages(community_id, channel_id, id);
+          CREATE INDEX IF NOT EXISTS idx_contacts_user ON contacts(user_id);
         `);
       },
       async close() { raw.close(); }
@@ -213,30 +235,64 @@ function postgresAdapter() {
     async init() {
       await pool.query(`
         CREATE TABLE IF NOT EXISTS users (
-          id BIGSERIAL PRIMARY KEY, username TEXT NOT NULL UNIQUE,
-          email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+          id BIGSERIAL PRIMARY KEY,
+          username TEXT NOT NULL UNIQUE,
+          email TEXT NOT NULL UNIQUE,
+          password_hash TEXT NOT NULL,
+          status TEXT DEFAULT 'offline',
+          last_seen TIMESTAMPTZ DEFAULT NOW(),
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS contacts (
+          id BIGSERIAL PRIMARY KEY,
+          user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          contact_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          status TEXT DEFAULT 'accepted',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          UNIQUE(user_id, contact_id)
+        );
+
         CREATE TABLE IF NOT EXISTS conversations (
-          id BIGSERIAL PRIMARY KEY, title TEXT,
-          is_group BOOLEAN NOT NULL DEFAULT FALSE, created_by BIGINT NOT NULL REFERENCES users(id),
+          id BIGSERIAL PRIMARY KEY,
+          title TEXT,
+          is_group BOOLEAN NOT NULL DEFAULT FALSE,
+          created_by BIGINT NOT NULL REFERENCES users(id),
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+
         CREATE TABLE IF NOT EXISTS conversation_members (
           conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
           user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
           joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           PRIMARY KEY(conversation_id, user_id)
         );
+
         CREATE TABLE IF NOT EXISTS messages (
           id BIGSERIAL PRIMARY KEY,
           conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
           sender_id BIGINT NOT NULL REFERENCES users(id),
-          body TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-          edited_at TIMESTAMPTZ, deleted_at TIMESTAMPTZ
+          body TEXT NOT NULL,
+          reply_to BIGINT REFERENCES messages(id) ON DELETE SET NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          edited_at TIMESTAMPTZ,
+          deleted_at TIMESTAMPTZ
         );
+
+        CREATE TABLE IF NOT EXISTS community_messages (
+          id BIGSERIAL PRIMARY KEY,
+          community_id BIGINT NOT NULL,
+          channel_id BIGINT NOT NULL,
+          sender_id BIGINT NOT NULL REFERENCES users(id),
+          body TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          deleted_at TIMESTAMPTZ
+        );
+
         CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);
         CREATE INDEX IF NOT EXISTS idx_members_user ON conversation_members(user_id);
+        CREATE INDEX IF NOT EXISTS idx_community_messages ON community_messages(community_id, channel_id, id);
+        CREATE INDEX IF NOT EXISTS idx_contacts_user ON contacts(user_id);
       `);
     },
     async close() { await pool.end(); }

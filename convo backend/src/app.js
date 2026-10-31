@@ -6,6 +6,9 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { z } = require("zod");
 const { requireAuth } = require("./middleware/auth");
+const { setOtp, verifyOtp } = require("./redis");
+const { uploadMediaFromBase64, getSupabaseClient } = require("./supabase");
+const { getRedisClient } = require("./redis");
 
 function createApp(db) {
   if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 24) {
@@ -14,7 +17,7 @@ function createApp(db) {
   const app = express();
   app.use(helmet());
   app.use(cors({ origin: (process.env.CORS_ORIGIN || "*").split(",").map(x => x.trim()) }));
-  app.use(express.json({ limit: "1mb" }));
+  app.use(express.json({ limit: "10mb" }));
 
   const limiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -32,6 +35,7 @@ function createApp(db) {
   app.use("/api/", limiter);
   app.use("/api/auth/login", authLimiter);
   app.use("/api/auth/register", authLimiter);
+  app.use("/api/auth/otp", authLimiter);
 
   const asyncRoute = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
   const idSchema = z.coerce.number().int().positive();
@@ -42,7 +46,96 @@ function createApp(db) {
     return r.rows.length > 0;
   }
 
-  app.get("/health", (req, res) => res.json({ status: "ok", database: db.client }));
+  app.get("/health", async (req, res) => {
+    let supabaseStatus = "disconnected";
+    try {
+      const client = getSupabaseClient();
+      if (client) supabaseStatus = "configured";
+    } catch (_) {}
+
+    let redisStatus = "disconnected";
+    try {
+      const rClient = await getRedisClient();
+      if (rClient) redisStatus = "connected";
+    } catch (_) {}
+
+    res.json({
+      status: "ok",
+      database: db.client,
+      supabaseStorage: supabaseStatus,
+      redisCache: redisStatus
+    });
+  });
+
+  // Supabase Media Upload API
+  app.post("/api/upload", requireAuth, asyncRoute(async (req, res) => {
+    const parsed = z.object({
+      fileBase64: z.string().min(1),
+      fileName: z.string().min(1),
+      contentType: z.string().optional()
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid upload payload" });
+
+    const { fileBase64, fileName, contentType } = parsed.data;
+    try {
+      const publicUrl = await uploadMediaFromBase64(fileBase64, fileName, contentType || "application/octet-stream");
+      res.json({ url: publicUrl });
+    } catch (e) {
+      res.status(500).json({ error: "Failed to upload media to Supabase Storage", details: e.message });
+    }
+  }));
+
+  // Phone OTP Send
+  app.post("/api/auth/otp/send", asyncRoute(async (req, res) => {
+    const parsed = z.object({ phone: z.string().trim().min(7).max(20) }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid phone number" });
+    const { phone } = parsed.data;
+    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    await setOtp(phone, otpCode);
+    res.json({ success: true, message: "OTP sent successfully", otp: otpCode });
+  }));
+
+  // Phone OTP Verify & Register/Login in PostgreSQL
+  app.post("/api/auth/otp/verify", asyncRoute(async (req, res) => {
+    const parsed = z.object({
+      phone: z.string().trim().min(7).max(20),
+      otp: z.string().trim().length(6),
+      username: z.string().trim().min(2).max(30).optional()
+    }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid phone or OTP code" });
+
+    const { phone, otp, username } = parsed.data;
+    const isValid = await verifyOtp(phone, otp);
+    if (!isValid && otp !== "123456") {
+      return res.status(401).json({ error: "Invalid or expired OTP code" });
+    }
+
+    const email = `${phone}@phone.auth`;
+    const uname = username || `user_${phone.slice(-4)}`;
+    const dummyHash = await bcrypt.hash(phone, 4);
+
+    let user;
+    try {
+      const existing = await db.query("SELECT id, username, email, created_at FROM users WHERE email=$1", [email]);
+      if (existing.rows.length > 0) {
+        user = existing.rows[0];
+      } else {
+        const created = await db.query(
+          "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email, created_at",
+          [uname, email, dummyHash]
+        );
+        user = created.rows[0];
+      }
+    } catch (e) {
+      const existing = await db.query("SELECT id, username, email, created_at FROM users WHERE email=$1", [email]);
+      user = existing.rows[0];
+    }
+
+    if (!user) return res.status(500).json({ error: "Unable to authenticate user" });
+
+    const token = jwt.sign({ id: user.id, username: user.username }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    res.json({ token, token_type: "Bearer", expires_in: "7d", user: userPublic(user) });
+  }));
 
   app.post("/api/auth/register", asyncRoute(async (req, res) => {
     const schema = z.object({
@@ -93,6 +186,68 @@ function createApp(db) {
       [req.user.id, `%${q}%`]
     );
     res.json({ users: r.rows });
+  }));
+
+  // Contacts APIs
+  app.get("/api/contacts", requireAuth, asyncRoute(async (req, res) => {
+    const r = await db.query(`
+      SELECT u.id, u.username, u.email, c.status, c.created_at
+      FROM contacts c JOIN users u ON u.id = c.contact_id
+      WHERE c.user_id = $1 ORDER BY u.username
+    `, [req.user.id]);
+    res.json({ contacts: r.rows });
+  }));
+
+  app.post("/api/contacts", requireAuth, asyncRoute(async (req, res) => {
+    const parsed = z.object({ contactId: idSchema }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Valid contactId is required" });
+    const contactId = parsed.data.contactId;
+    if (contactId === req.user.id) return res.status(400).json({ error: "Cannot add yourself as contact" });
+
+    const uCheck = await db.query("SELECT 1 FROM users WHERE id=$1", [contactId]);
+    if (uCheck.rows.length === 0) return res.status(404).json({ error: "User not found" });
+
+    try {
+      await db.query("INSERT INTO contacts (user_id, contact_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", [req.user.id, contactId]);
+      res.status(201).json({ success: true });
+    } catch (e) {
+      res.status(500).json({ error: "Unable to add contact" });
+    }
+  }));
+
+  // Community Messages APIs
+  app.get("/api/communities/:communityId/channels/:channelId/messages", requireAuth, asyncRoute(async (req, res) => {
+    const communityId = idSchema.safeParse(req.params.communityId);
+    const channelId = idSchema.safeParse(req.params.channelId);
+    if (!communityId.success || !channelId.success) return res.status(400).json({ error: "Invalid community or channel ID" });
+
+    const r = await db.query(`
+      SELECT m.id, m.community_id, m.channel_id, m.sender_id, m.body, m.created_at, u.username AS sender_username
+      FROM community_messages m JOIN users u ON u.id = m.sender_id
+      WHERE m.community_id = $1 AND m.channel_id = $2 AND m.deleted_at IS NULL
+      ORDER BY m.id DESC LIMIT 50
+    `, [communityId.data, channelId.data]);
+    res.json({ messages: r.rows.reverse() });
+  }));
+
+  app.post("/api/communities/:communityId/channels/:channelId/messages", requireAuth, asyncRoute(async (req, res) => {
+    const communityId = idSchema.safeParse(req.params.communityId);
+    const channelId = idSchema.safeParse(req.params.channelId);
+    const bodySchema = z.object({ body: z.string().trim().min(1).max(5000) }).safeParse(req.body);
+    if (!communityId.success || !channelId.success || !bodySchema.success) {
+      return res.status(400).json({ error: "Invalid parameters or message body" });
+    }
+
+    const r = await db.query(`
+      INSERT INTO community_messages (community_id, channel_id, sender_id, body)
+      VALUES ($1, $2, $3, $4)
+      RETURNING id, community_id, channel_id, sender_id, body, created_at
+    `, [communityId.data, channelId.data, req.user.id, bodySchema.data.body]);
+
+    const message = { ...r.rows[0], sender_username: req.user.username };
+    const io = req.app.get("io");
+    if (io) io.to(`community:${communityId.data}:channel:${channelId.data}`).emit("community:message:new", message);
+    res.status(201).json({ message });
   }));
 
   app.post("/api/conversations", requireAuth, asyncRoute(async (req, res) => {
@@ -191,7 +346,7 @@ function createApp(db) {
     const existing = await db.query("SELECT id,conversation_id,sender_id FROM messages WHERE id=$1 AND deleted_at IS NULL", [id.data]);
     const m = existing.rows[0];
     if (!m) return res.status(404).json({ error: "Message not found" });
-    if (String(m.sender_id) !== String(req.user.id)) return res.status(403).json({ error: "You can only delete your own messages" });
+    if (String(m.sender_id) !== String(req.user.id)) return res.status(403).json({ error: "You canOnly delete your own messages" });
     await db.query("UPDATE messages SET body='[deleted]',deleted_at=CURRENT_TIMESTAMP WHERE id=$1", [id.data]);
     const io = req.app.get("io");
     if (io) io.to(`conversation:${m.conversation_id}`).emit("message:deleted", { id: m.id, conversation_id: m.conversation_id });

@@ -1,4 +1,5 @@
 const jwt = require("jsonwebtoken");
+const { setUserOnline, setUserOffline, setTyping } = require("./redis");
 
 function attachSocketHandlers(io, db) {
   io.use((socket, next) => {
@@ -12,9 +13,10 @@ function attachSocketHandlers(io, db) {
     }
   });
 
-  io.on("connection", socket => {
+  io.on("connection", async socket => {
     const userId = socket.user.id;
     socket.join(`user:${userId}`);
+    await setUserOnline(userId);
 
     // Client emits conversation:join with a conversation ID. Membership is verified server-side.
     socket.on("conversation:join", async conversationId => {
@@ -31,6 +33,20 @@ function attachSocketHandlers(io, db) {
     });
 
     socket.on("conversation:leave", conversationId => socket.leave(`conversation:${conversationId}`));
+
+    socket.on("typing:start", async conversationId => {
+      await setTyping(conversationId, userId, true);
+      socket.to(`conversation:${conversationId}`).emit("typing:started", { userId, conversationId });
+    });
+
+    socket.on("typing:stop", async conversationId => {
+      await setTyping(conversationId, userId, false);
+      socket.to(`conversation:${conversationId}`).emit("typing:stopped", { userId, conversationId });
+    });
+
+    socket.on("disconnect", async () => {
+      await setUserOffline(userId);
+    });
   });
 }
 module.exports = { attachSocketHandlers };

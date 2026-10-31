@@ -35,12 +35,14 @@ test("SQLite Database Adapter and REST API Integration Tests", async t => {
   let token = "";
   let conversationId = null;
 
-  await t.test("Health check", async () => {
+  await t.test("Health check with Supabase and Redis status", async () => {
     const res = await fetch(`${baseUrl}/health`);
     const data = await res.json();
     assert.strictEqual(res.status, 200);
     assert.strictEqual(data.status, "ok");
     assert.ok(data.database === "sqlite" || data.database === "sqlite-memory");
+    assert.ok(data.supabaseStorage !== undefined);
+    assert.ok(data.redisCache !== undefined);
   });
 
   await t.test("Register user", async () => {
